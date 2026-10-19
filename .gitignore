@@ -1,0 +1,15 @@
+# Personal data: the memory DB lives in the private Asaf_AI_Agent-data repo (SPEC.md §9.1)
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/

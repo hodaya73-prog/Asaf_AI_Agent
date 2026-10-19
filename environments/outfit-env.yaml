@@ -1,0 +1,10 @@
+# Session environment for both outfit agents (SPEC.md §3).
+# The agents only use custom tools, which run in the GitHub Actions orchestrator,
+# so the container needs no network access at all.
+name: outfit-agent-env
+config:
+  type: cloud
+  networking:
+    type: limited
+    allowed_hosts: []
+    allow_package_managers: false
