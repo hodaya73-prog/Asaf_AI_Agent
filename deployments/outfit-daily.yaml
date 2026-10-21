@@ -1,0 +1,20 @@
+# Daily 07:00 run of the Outfit Agent (SPEC.md §6), fired by Claude Platform.
+# The session's custom tools are answered by the tool worker on the local PC
+# (tools/LocalToolRunner today), which also sends the outfit email.
+name: Outfit Agent - daily 07:00
+agent: ../agents/outfit-agent.md
+environment_id: ../environments/outfit-env.yaml
+schedule:
+  type: cron
+  expression: "0 7 * * *"
+  timezone: Asia/Jerusalem
+budget:
+  type: limit
+  max_list_cost: {amount: "25", currency: USD}   # $0.25 cap per run
+initial_events:
+  - type: user.message
+    content:
+      - type: text
+        text: |
+          mode: daily
+          date: today

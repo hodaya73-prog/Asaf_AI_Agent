@@ -9,9 +9,15 @@
     "./agents/outfit-agent.md": {
       "kind": "agent",
       "id": "agent_01MWduF1ekdbAGL3Yqq1hxyE",
-      "version": "2",
-      "hash": "d23ebd9e0f5e81f8a9bc64bc9ff0afb6",
-      "remote_hash": "5d93825b58b893518232fee2d5db96f0"
+      "version": "5",
+      "hash": "65cbabe518e6d311537dbeb6d36f706e",
+      "remote_hash": "b3212bfbb652eefee822850c28311b6e"
+    },
+    "./deployments/outfit-daily.yaml": {
+      "kind": "deployment",
+      "id": "depl_01Y1QzXPprzAMfNy8nNzwNRf",
+      "hash": "d15b5d7933d217209d967088e2317b3e",
+      "remote_hash": "d15b5d7933d217209d967088e2317b3e"
     },
     "./environments/outfit-env.yaml": {
       "kind": "environment",

@@ -13,3 +13,7 @@ __pycache__/
 *.py[cod]
 .venv/
 .pytest_cache/
+
+# .NET build output
+bin/
+obj/

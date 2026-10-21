@@ -1,9 +1,12 @@
 # Daily Outfit Agent — Specification
 
-> Status: draft v1.3 · 2026-10-19
-> v1.1: repo is public, so the memory DB moves to a private data repo (§9.1, §14.1).
+> Status: v1.6 · 2026-10-21. **Stage A is live**: a Claude Platform scheduled deployment starts the agent at 07:00, and a tool runner on the PC answers its tools and sends the email through Gmail. Stage B (GitHub Actions, PC can be off) is planned.
+> v1.1: repo is public, so the memory DB moves to a private data repo (§9.3, §14.1).
 > v1.2: the agent lives on Claude Platform as a Managed Agent; the orchestrator drives its sessions and runs its custom tools (§2, §7, §11.1).
 > v1.3: the stylist and ingest agents are merged into a single **Outfit Agent** with two run modes (`daily`, `ingest`).
+> v1.4: a new user starts with an interactive `setup` chat: the agent asks for and confirms the email address, then sends the onboarding questionnaire itself. `USER_EMAIL` is no longer a secret (§4, §5, §7, §14).
+> v1.5: onboarding moves entirely into the setup chat on Claude Platform (email address, questions, wardrobe review). Email is used only for the daily outfit; `send_onboarding_questions` and `send_wardrobe_review` are replaced by `complete_onboarding` (§4, §5, §7).
+> v1.6: the 07:00 trigger is a **Claude Platform scheduled deployment**, and the tool worker is `tools/LocalToolRunner` (C#) on the PC, which also sends the outfit through Gmail SMTP. This is stage A. The GitHub Actions orchestrator, SQLite in a private data repo and IMAP replies move to stage B (§2, §3, §6, §9, §12–§17).
 
 ## 1. Goal
 
@@ -16,81 +19,92 @@ Every morning at **07:00 Israel time**, the agent emails the user **one complete
 
 The user never has to open a computer or ask: the suggestion arrives in their inbox, readable on a phone. Everything the user tells the agent (by email) is stored in the agent's own database.
 
-**Style-agnostic by design.** Nothing about any specific user's taste is hard-coded. On first use, the agent emails an onboarding questionnaire, stores the answers, and infers a starting wardrobe from them. The same code works for any user.
+**Style-agnostic by design.** Nothing about any specific user's taste is hard-coded. On first use, the agent holds a setup chat on Claude Platform: it asks which email address to use, asks its setup questions, stores the answers, and builds a starting wardrobe with the person. Email is used only for the daily outfit. The same code works for any user.
 
 ## 2. Decisions
 
-| Area | Decision |
-|---|---|
-| Language | Python 3.12 |
-| LLM | Claude Haiku 5.5 (`claude-haiku-5-5`) via the official `anthropic` Python SDK |
-| Agent | One **Claude Managed Agent** on Claude Platform: *Outfit Agent* (`agent_01MWduF1ekdbAGL3Yqq1hxyE`). It's defined in `agents/outfit-agent.md` + `environments/outfit-env.yaml` and synced with `ant apply`. IDs are in `claude-lock.json`. |
-| Run modes | `daily` (apply new replies to memory, then pick the outfit) and `ingest` (apply new replies only), chosen by the first message of the session |
-| Agent loop | The orchestrator starts one Managed Agents **session** per run and executes the agent's **custom tools** (§7) itself, against SQLite and Open-Meteo |
-| Weather | Open-Meteo Forecast + Geocoding APIs (free, no API key) |
-| Email out | SMTP (Gmail, App Password) — HTML + plain-text body |
-| Email in | IMAP (same mailbox) — reads user replies and rating emails |
-| Feedback | Both: (a) free-text reply to the daily email, (b) 1–5 rating links (`mailto:` links, no web server needed) |
-| Location | Asked during onboarding, geocoded once, stored in the DB |
-| Memory | SQLite file `data/agent.db`, **never committed to this public repo** (git-ignored) |
-| DB persistence | Stored in a separate **private** GitHub repo (`Asaf_AI_Agent-data`); pulled at the start of each run and pushed back at the end (§9.1) |
-| Host / scheduler | GitHub Actions cron in this **public** repo (code only, no personal data) |
-| Users | v1 = one user per deployment; schema keeps `user_id` so multi-user is possible later |
+The system is built in two stages. **Stage A runs today.** Stage B replaces the PC parts so the email arrives even when the PC is off.
+
+| Area | Stage A: running now | Stage B: planned |
+|---|---|---|
+| LLM | Claude Haiku 5.5 (`claude-haiku-5-5`), effort `medium` | same |
+| Agent | One **Claude Managed Agent** on Claude Platform: *Outfit Agent* (`agent_01MWduF1ekdbAGL3Yqq1hxyE`), defined in `agents/outfit-agent.md` + `environments/outfit-env.yaml`, synced with `ant apply`. IDs are in `claude-lock.json`. | same |
+| Daily trigger | **Claude Platform scheduled deployment** `deployments/outfit-daily.yaml`: every day 07:00 `Asia/Jerusalem`, $0.25 cap per run (§9.1) | GitHub Actions cron (§9.2) |
+| Tool worker | `tools/LocalToolRunner` (C#, .NET 9) on the PC: watches the agent's sessions and answers every custom tool call (§7). The PC must be on with it running. | Python orchestrator (`python -m outfit_agent`) on GitHub Actions |
+| Memory | One JSON file, `data/local-runner/state.json` (git-ignored), one user | SQLite `agent.db` (§13) in a private data repo (§9.3) |
+| Email out | Gmail SMTP from the runner, plain text, **the daily outfit only** (§12) | same, plus an HTML version |
+| Email in | Not read yet. Feedback and wardrobe changes go through a chat with the agent in the Claude Console. | IMAP: replies and rating emails (§8) |
+| Run modes | setup chat (first session, in the Console), `daily` (the deployment); free chat in the Console anytime | adds `ingest` (replies, every ~2 h) |
+| Weather | Open-Meteo Forecast + Geocoding APIs (free, no API key), called by the runner | same |
+| Location | Asked in the setup chat, geocoded once, stored in memory | same |
+| Users | One user per runner | schema keeps `user_id` for multi-user later |
+| Repo | This **public** repo holds code only, never personal data (§14.1) | same |
 
 ## 3. How it works (overview)
 
+Stage A (running now):
+
 ```
-                GitHub Actions (cron, UTC)
-                          │
-                          ▼
-              ┌──────────────────────┐
-              │  main.py  (Python)   │  time guard: is it ≥ 06:45 Israel
-              │  orchestrator        │  time and nothing sent today?
-              └──────────┬───────────┘
-        ┌────────────────┼─────────────────┬────────────────┐
-        ▼                ▼                 ▼                ▼
-  IMAP: read new    SQLite memory     Open-Meteo        Claude Haiku 5.5
-  replies/ratings   (profile, prefs,  (forecast for     (agent loop with
-                    wardrobe, history) user's lat/lon)   the tools in §7)
-        │                ▲                 │                │
-        └───── update ───┘                 └──── context ───┘
-                          │
-                          ▼
-                 SMTP: send outfit email ──► user's phone
-                          │
-                          ▼
-     push agent.db to the private data repo (memory persists)
+   Claude Platform                                   The user's PC
+ ┌────────────────────────────┐              ┌──────────────────────────────┐
+ │ Scheduled deployment       │              │ tools/LocalToolRunner (C#)   │
+ │ 07:00 Asia/Jerusalem       │              │  polls sessions every 2 s    │
+ │   │ creates a session      │  tool calls  │  answers custom tools (§7)   │
+ │   ▼                        │ ───────────► │  state.json (profile, prefs, │
+ │ Outfit Agent session       │ ◄─────────── │   wardrobe, outfits)         │
+ │ Haiku 5.5, no network      │ tool results │  Open-Meteo (weather, city)  │
+ │                            │              │  validates submit_outfit     │
+ │ Claude Console chat        │              │  Gmail SMTP ──► user's phone │
+ │ (setup + any later chat)   │              └──────────────────────────────┘
+ └────────────────────────────┘
 ```
 
-The **orchestrator is plain Python** and owns everything with side effects outside the agent's memory: the clock, reading mail, sending mail, and the recipient address. **The LLM never chooses who gets an email.** The LLM works only through the tools in §7.
+Stage B (planned) moves the PC side to GitHub Actions:
+
+```
+   GitHub Actions cron ──► main.py orchestrator ──► Outfit Agent session (same agent)
+                              │  answers tools against SQLite (private data repo)
+                              │  IMAP: replies and ratings
+                              └─ SMTP: outfit email ──► user's phone
+```
+
+In both stages, **plain code owns everything with side effects** outside the agent's memory: the clock, sending mail, and the recipient address. **The LLM never chooses who gets an email.** The LLM works only through the tools in §7, and its container has no network access.
 
 ## 4. Run modes
 
 | Mode | Trigger | What it does |
 |---|---|---|
-| `daily` | cron (see §9) + manual `workflow_dispatch` | Read new mail, then pick an outfit, send it and save it |
-| `ingest` | cron every ~2 h, 08:00–22:00 Israel time | Read new mail only (feedback, onboarding answers, wardrobe changes). Exits right away when the inbox has nothing new. No LLM call in that case. |
-| `onboard` | manual, or `daily` sees no completed profile | Send the onboarding questionnaire |
-| `--dry-run` | flag on any mode | Print the email to stdout instead of sending it, and don't write to the DB |
+| `daily` | **Stage A:** the scheduled deployment at 07:00 (§9.1), or a manual run with `ant beta:deployments run`. **Stage B:** cron + `workflow_dispatch` (§9.2). | Pick today's outfit, send it and save it (§6) |
+| setup chat | the person opens a session with the Outfit Agent in the **Claude Console** while the tool worker runs | First session for a new user, all in the chat: ask for and confirm the email address, ask the setup questions, build and review the wardrobe, finish (§5.1) |
+| chat | any later session in the Claude Console, with the tool worker running | Tell the agent about feedback, new clothes or changed preferences; it updates memory. Never sends an outfit. |
+| tool worker | **Stage A:** `dotnet run --project tools/LocalToolRunner` on the PC, long-running. **Stage B:** `python -m outfit_agent tools`. | Watches the agent's sessions and answers their custom tool calls. Needed for every session; without it a session waits at its first tool call. |
+| `ingest` | **Stage B only:** cron every ~2 h, 08:00–22:00 Israel time | Read new mail (feedback on outfits, wardrobe or preference changes). Exits right away when the inbox has nothing new. |
+| `--dry-run` | **Stage B only:** flag on any mode | Print the email to stdout instead of sending it, and don't write to the DB |
 
 ## 5. Onboarding (first use)
 
-### 5.1 Flow
+Onboarding happens **entirely in a chat on Claude Platform**. Email is used **only for the daily outfit**: no questionnaire email, no wardrobe-review email, no reminders.
 
-1. **First run** finds no user profile → sends the **onboarding questionnaire** email (§5.2) and sets the user to `onboarding_status = 'questionnaire_sent'`.
-2. User **replies in free text**, answering whatever they like and in any order.
-3. The next `ingest` / `daily` run reads the reply. The agent then:
-   - pulls the answers into structured **preferences** (tool `upsert_preference`),
-   - geocodes the city (tool `geocode_city`) and stores lat/lon,
-   - **infers a starting wardrobe**: about 25–40 typical items that fit the stated style, climate and lifestyle, each saved with `status = 'assumed'`.
-4. The agent sends a **"Here's what I think you own"** email listing the assumed wardrobe by category, and asks the user to reply with corrections ("no beige chinos", "add: grey wool coat, black Chelsea boots").
-5. `onboarding_status = 'active'`. Daily suggestions start the next morning. Assumed items can already be used; an item becomes `confirmed` as soon as the user mentions it or rates an outfit that used it without complaint.
-6. Missing answers fall back to neutral defaults (e.g. temperature sensitivity = neutral). If the user hasn't replied after 3 days, one gentle reminder is sent. No further reminders after that.
+### 5.1 Flow: the setup chat
 
-### 5.2 Onboarding questionnaire (email content)
+The person opens a session with the *Outfit Agent* in the **Claude Console** and starts chatting. Any first message works, e.g. "Hi, I'm new". While the chat runs, the orchestrator's **tool worker** must be running so the agent's custom tools get answered (`python -m outfit_agent tools`, §4; today the stand-in is `tools/LocalToolRunner`). The worker creates an empty `users` row (`onboarding_status = 'new'`, no email) the first time it's needed.
 
-> Hi! I'm your daily outfit assistant. Every morning at 7:00 I'll email you an outfit based on the weather and on what you like and own. Just **reply to this email** and answer whatever you like. Short answers are fine.
->
+1. **Email address.** The agent greets the person, explains that one outfit arrives by email every morning at 7:00, and asks which address to send it to. It **repeats the address back and asks for confirmation**, and only then calls `set_user_email`. The tool works only while no email is on file and the worker checks the format, so the agent can't change the address later. The address comes **only from the person's own answer in the chat**; the agent never guesses or invents one.
+2. **The questions (§5.2)**, asked in the chat a few at a time. After each answer the agent saves what it learned right away: `update_user_profile` (name, language, typical day and dress code, commute, temperature sensitivity), `geocode_city` (lat/lon), and `upsert_preference` with source `onboarding` (style, colours, fit, never_wear, requirements, weekend, shoes, accessories). It asks short follow-ups when an answer is unclear and accepts skipped topics.
+3. **The wardrobe.** The agent adds the clothes the person listed (`confirmed`), then **infers the rest of a starting wardrobe**, 25–40 items in total that fit their style, colours, fit, lifestyle, dress code and climate (`assumed`). It shows the whole list **in the chat**, grouped by category with its guesses marked, and applies corrections ("no beige chinos", "I have a green puffer coat instead") until the person says it's right.
+4. **Finish.** The agent calls `complete_onboarding` with a one-line summary per topic. The worker refuses until (a) all 14 topics have an answer ("none" or "skipped" count), and (b) the wardrobe has at least 25 items, including a warm (`warmth_level` 4–5) and a waterproof outer layer. Then it stores the summary and sets `onboarding_status = 'active'`. The agent tells the person that their first outfit arrives by email tomorrow at 7:00, and that they can reply to any outfit email with feedback.
+
+Rules around it:
+- While no email is on file, only `get_user_profile` and `set_user_email` work. Until `active`, `get_weather` and `submit_outfit` are refused (§7).
+- If the chat stops halfway, the next chat continues from what's already saved instead of asking again.
+- Scheduled runs (`daily`, `ingest`) for a user who isn't `active` do nothing and log "setup needed".
+- The tool worker saves everything right away (stage A: `state.json`; stage B: `agent.db`, pushed to the private data repo, §9.3).
+- Assumed items can be used right away. An item becomes `confirmed` as soon as the user mentions it or rates an outfit that used it without complaint.
+
+### 5.2 The setup questions
+
+The agent asks these in the chat, in its own words and in the person's language once it's known. `complete_onboarding` has **14 required topic fields**, one per question, so setup can't finish with a topic missing. Reference wording:
+
 > 1. **Your name**, and which **language** should I write to you in?
 > 2. **Which city/area** do you live in? (I use it for the weather.)
 > 3. **A typical weekday**: office, working from home, school, on your feet, outdoors? Is there a **dress code**?
@@ -108,51 +122,94 @@ The **orchestrator is plain Python** and owns everything with side effects outsi
 
 ## 6. Daily run (step by step)
 
-1. **Time guard**: continue only if local time in `Asia/Jerusalem` is ≥ 06:45 **and** no suggestion row exists for today's local date. This makes the two cron entries (§9) safe across daylight-saving changes and lets a later run catch up when an earlier one failed.
+### 6.1 Stage A (running now)
+
+1. **07:00 Asia/Jerusalem**: the scheduled deployment (§9.1) creates a session for the Outfit Agent with the message `mode: daily` / `date: today`. Claude Platform may start it up to ~9 minutes late.
+2. The agent calls `get_user_profile`. The tool runner answers with the profile, including `today` (the real local date), which the agent uses as the date. A user who isn't `active` gets no outfit.
+3. The agent reads `list_preferences`, `list_wardrobe`, `get_recent_outfits` and `get_weather`. The runner fetches the forecast from Open-Meteo (§10) for the stored location, hours 07:00–23:00.
+4. The agent calls `submit_outfit` once (§11.2).
+5. The runner **validates** it (§11.3): every item owned and not removed, nothing matching `never_wear`, a bottom and shoes, and **only one outfit per date**. Problems go back to the agent as a tool error, and it fixes the outfit and submits again.
+6. The runner **saves** the outfit in `state.json`, updates each item's `last_worn_date`, writes a copy to `data/local-runner/outbox/`, and **sends the email** through Gmail SMTP to the address from the setup chat (§12).
+
+**If the PC is off or the runner isn't running at 07:00**, the session waits at its first tool call. When the runner starts, it answers the waiting calls and the email goes out late. This happened on 2026-10-21: the run started at 07:08 and the email went out at 21:14. Stage B removes this limit.
+
+### 6.2 Stage B (planned)
+
+1. **Time guard**: continue only if local time in `Asia/Jerusalem` is ≥ 06:45 **and** no suggestion row exists for today's local date. This makes the two cron entries (§9.2) safe across daylight-saving changes and lets a later run catch up when an earlier one failed.
 2. **Fetch mail** (§8). Rating emails are recorded in code. Free-text replies are collected for step 4.
 3. **Fetch weather** for today, hourly from 07:00 to 23:00 (§10). This becomes the `get_weather` tool result: a *morning / midday / evening* summary with temperature + feels-like, chance of rain and amount, wind, UV and humidity.
 4. **Run the Outfit Agent** (§11) in **one session**, with the first message `mode: daily`, `date: …` and any new replies in `<user_email>` tags. The agent first applies the replies to memory (Part 1 of its prompt). Then it reads profile, preferences, wardrobe, the last 14 days of outfits with feedback, and the weather, and calls `submit_outfit` exactly once (Part 2).
 5. **Validate** in code (§11.3). If validation fails, send the errors back to the agent as a tool error. It gets up to 2 retries.
 6. **Render & send** the email (§12).
 7. **Save**: an `outfit_suggestions` row, `suggestion_items` rows, `last_worn_date` on each item, and a `run_log` row.
-8. **Persist**: the workflow pushes `agent.db` back to the private data repo (§9.1).
+8. **Persist**: the workflow pushes `agent.db` back to the private data repo (§9.3).
 
 **If something fails**, the user still gets an email: weather down → "couldn't get the forecast, here's a safe layered outfit". Claude unavailable or `stop_reason == "refusal"` → short apology email. Errors are written to `run_log` and to the Actions log.
 
 ## 7. Agent tools
 
-The tools are **custom tools** declared on the agent (input schemas live in `agents/outfit-agent.md`). When a session emits `agent.custom_tool_use`, the orchestrator runs the matching plain Python function and sends back `user.custom_tool_result`. Each function reads from or writes to SQLite or calls Open-Meteo. None of them can send email or touch the network beyond Open-Meteo. The session container itself has no network access (`allowed_hosts: []`).
+The tools are **custom tools** declared on the agent (input schemas live in `agents/outfit-agent.md`). When a session emits `agent.custom_tool_use`, the orchestrator runs the matching plain Python function and sends back `user.custom_tool_result`. Each function reads from or writes to SQLite or calls Open-Meteo. None of them can touch the network beyond Open-Meteo, and none sends email: the only email in the system is the daily outfit, sent by the orchestrator after `submit_outfit`. The session container itself has no network access (`allowed_hosts: []`).
 
-The "Used in" column below is also **enforced by the orchestrator**: in an `ingest` session, a call to `get_weather` or `submit_outfit` is answered with an error and never executed.
+The "Used in" column below is also **enforced by the orchestrator**: a tool called outside its modes is answered with an error and never executed. On top of that, while no email is on file only `get_user_profile` and `set_user_email` work, and until `onboarding_status = 'active'` the tools `get_weather` and `submit_outfit` are refused.
 
 | Tool | Purpose | Used in |
 |---|---|---|
 | `get_weather(date)` | Today's forecast summary + hourly table for the stored lat/lon | daily |
-| `geocode_city(name)` | City → lat/lon/timezone via Open-Meteo Geocoding; stores it on the profile | ingest |
-| `get_user_profile()` | Name, language, city, lifestyle, dress code, commute, temperature sensitivity, onboarding status | all |
-| `update_user_profile(...)` | Change name, language, lifestyle, commute or temperature sensitivity | ingest |
+| `geocode_city(name)` | City → lat/lon/timezone via Open-Meteo Geocoding; stores it on the profile | setup chat, ingest |
+| `get_user_profile()` | Whether an email is on file (never the address itself), name, language, city, lifestyle, dress code, commute, temperature sensitivity, onboarding status | all |
+| `set_user_email(email)` | Save the address the person confirmed in the setup chat. Only while no email is on file; the format is checked in code. | setup chat |
+| `complete_onboarding(answers{14 topics})` | Finish the setup chat: refused until every topic has an answer and the wardrobe has ≥ 25 items with a warm and a waterproof outer layer; then sets `active` (§5.1) | setup chat |
+| `update_user_profile(...)` | Change name, language, lifestyle, commute or temperature sensitivity | setup chat, ingest |
 | `list_preferences(category?)` | Stored opinions (likes, dislikes, never-wear, colours, fit, …) | all |
-| `upsert_preference(category, key, value, source)` | Add or update one opinion | ingest |
-| `remove_preference(id)` | Delete an opinion the user retracted | ingest |
+| `upsert_preference(category, key, value, source)` | Add or update one opinion | setup chat, ingest |
+| `remove_preference(id)` | Delete an opinion the user retracted | setup chat, ingest |
 | `list_wardrobe(category?, status?)` | Owned items, with warmth/formality/waterproof flags and `last_worn_date` | all |
-| `add_wardrobe_item(...)` | New item (`assumed` during onboarding, `confirmed` when the user states it) | ingest |
-| `update_wardrobe_item(id, ...)` | Change attributes or status (`confirmed`, `removed`) | ingest |
+| `add_wardrobe_item(...)` | New item (`assumed` when inferred in the setup chat, `confirmed` when the user states it) | setup chat, ingest |
+| `update_wardrobe_item(id, ...)` | Change attributes or status (`confirmed`, `removed`) | setup chat, ingest |
 | `get_recent_outfits(days=14)` | Past suggestions with ratings and comments | daily, ingest |
 | `record_feedback(suggestion_id, rating?, comment?)` | Store feedback about a specific suggestion | ingest |
 | `submit_outfit(...)` | **Final answer** of the daily run: items by layer, reasoning, weather tips (§11.2). Schema with `additionalProperties: false`, re-checked in code (§11.3). | daily |
 
-## 8. Reading mail (feedback + updates)
+## 8. Reading mail (feedback + updates), stage B
+
+Not built yet. In stage A the agent doesn't read email; the user gives feedback and wardrobe changes in a chat with the agent in the Claude Console.
 
 - Connect over IMAP and fetch messages not yet listed in `processed_emails`.
-- **Allowlist**: only messages from the configured `USER_EMAIL` are handled. All other mail is marked processed and ignored.
+- **Allowlist**: only messages from the user's email on file (saved in the setup chat, §5.1) are handled. All other mail is marked processed and ignored.
 - **Rating links**: the daily email contains five `mailto:` links. Each opens a pre-filled email to the agent mailbox with a subject like `[outfit#142] rating 4`. These are parsed **in code** (regex), with no LLM call, and stored with `record_feedback`.
-- **Free-text replies**: the `In-Reply-To` header / `[outfit#ID]` subject tag links the reply to its suggestion. Quoted history is stripped. The new text goes to the **Outfit Agent**: in an `ingest` session (effort `low`), or as Part 1 of the morning's `daily` session. The agent sorts what it reads into feedback on that outfit, a wardrobe change, a preference change or onboarding answers, and applies it with the tools.
-- **Prompt-injection guard**: email text is wrapped as *data* in the prompt ("this is what the user wrote; extract facts from it"). The agent's tools only touch the user's own memory and the weather, so even a malicious email can't send mail or reach anything else. Because one agent both reads replies and picks the outfit, a crafted email could at worst steer that day's outfit. The validator (§11.3) still forces the outfit to use owned items and respect `never_wear`, and the email still goes only to `USER_EMAIL`.
+- **Free-text replies**: the `In-Reply-To` header / `[outfit#ID]` subject tag links the reply to its suggestion. Quoted history is stripped. The new text goes to the **Outfit Agent**: in an `ingest` session (effort `low`), or as Part 1 of the morning's `daily` session. The agent sorts what it reads into feedback on that outfit, a wardrobe change or a preference change, and applies it with the tools.
+- **Prompt-injection guard**: email text is wrapped as *data* in the prompt ("this is what the user wrote; extract facts from it"). The agent's tools only touch the user's own memory and the weather, so even a malicious email can't send mail or reach anything else. Because one agent both reads replies and picks the outfit, a crafted email could at worst steer that day's outfit. The validator (§11.3) still forces the outfit to use owned items and respect `never_wear`, and the email still goes only to the address on file.
 - Every handled message is saved in `processed_emails` (by `Message-ID`), so nothing is processed twice.
 
-## 9. Scheduling (GitHub Actions)
+## 9. Scheduling
 
-Cron in GitHub Actions is in UTC, and Israel switches between UTC+2 (winter) and UTC+3 (summer). The workflow therefore runs twice and the time guard (§6.1) decides which run sends:
+### 9.1 Stage A: Claude Platform scheduled deployment (running now)
+
+`deployments/outfit-daily.yaml`, synced with `ant apply` (ID `depl_01Y1QzXPprzAMfNy8nNzwNRf` in `claude-lock.json`):
+
+```yaml
+name: Outfit Agent - daily 07:00
+agent: ../agents/outfit-agent.md
+environment_id: ../environments/outfit-env.yaml
+schedule: {type: cron, expression: "0 7 * * *", timezone: Asia/Jerusalem}
+budget: {type: limit, max_list_cost: {amount: "25", currency: USD}}   # $0.25 per run
+initial_events:
+  - type: user.message
+    content: [{type: text, text: "mode: daily\ndate: today\n"}]
+```
+
+- **Timezone**: the cron runs on Israel wall-clock time, so daylight-saving changes need no special handling. It fires at 04:00 UTC in summer and 05:00 UTC in winter.
+- **Jitter**: Claude Platform starts each run up to ~9 minutes after the scheduled time.
+- **No client is attached** when the run fires. The session pauses at its first custom tool call until the tool worker answers (§6.1), so the PC must be on with `tools/LocalToolRunner` running.
+- **Date**: the message can't carry a date, so it says `date: today` and the agent takes the real date from `get_user_profile`.
+- **Agent version**: the deployment pins the agent version it was applied with. After changing `agents/outfit-agent.md`, apply both files together so the deployment moves to the new version: `ant apply agents/outfit-agent.md environments/outfit-env.yaml deployments/outfit-daily.yaml`.
+- **Test it**: `ant beta:deployments run --deployment-id depl_01Y1QzXPprzAMfNy8nNzwNRf` starts one run immediately, like 07:00. Remember the one-outfit-per-day rule.
+- **Pause/resume**: `ant beta:deployments pause` / `unpause` with the same ID. Missed runs are not made up.
+- **Audit**: `ant beta:deployment-runs list --deployment-id …` lists each run with its session or error.
+
+### 9.2 Stage B: GitHub Actions (planned)
+
+Cron in GitHub Actions is in UTC, and Israel switches between UTC+2 (winter) and UTC+3 (summer). The workflow therefore runs twice and the time guard (§6.2) decides which run sends:
 
 ```yaml
 on:
@@ -162,7 +219,7 @@ on:
     - cron: "15 5-19/2 * * *"  # ingest-only runs through the day
   workflow_dispatch:
     inputs:
-      mode: { type: choice, options: [daily, ingest, onboard], default: daily }
+      mode: { type: choice, options: [daily, ingest], default: daily }   # setup is interactive, local only
       dry_run: { type: boolean, default: false }
 
 concurrency:
@@ -174,7 +231,7 @@ concurrency:
 - Expected Actions usage: about 2 daily + 8 ingest runs × ~1 min = **~300 min/month**. Standard runners are free for public repos.
 - **Keep the schedule alive**: GitHub disables scheduled workflows in a public repo after 60 days without repository activity. The agent's daily writes now go to the data repo, so this repo can go quiet. The daily run therefore ends with a keep-alive step that re-enables its own workflow (`gh api -X PUT repos/{owner}/{repo}/actions/workflows/agent.yml/enable`, needs `permissions: actions: write`). Verify during milestone 7 that this resets the inactivity timer. If it doesn't, fall back to a monthly empty commit to `main`.
 
-### 9.1 Persisting the memory DB (private data repo)
+### 9.3 Stage B: persisting the memory DB (private data repo)
 
 This repo is public, and anything committed to it is public forever, including in git history. The DB holds the user's email address, city, wardrobe and opinions, so it lives in a **separate private repo**, `hodaya73-prog/Asaf_AI_Agent-data`, which holds only `agent.db`.
 
@@ -216,10 +273,12 @@ The concurrency group (`agent-db`) still applies: only one run at a time touches
 ### 11.1 Model settings
 
 - Set on the agent: `model: {id: claude-haiku-5-5, effort: medium}`. `ingest` sessions override it with `model: {id: claude-haiku-5-5, effort: low}`. A per-session override replaces the whole `model` object, so it must repeat the id. Adaptive thinking is the Haiku 5.5 default.
-- Per run, the orchestrator calls `sessions.create(agent=<id from claude-lock.json>, environment_id=<outfit-env>)` and sends the first `user.message`: a header (`mode: daily` + `date: YYYY-MM-DD`, or `mode: ingest`) followed by any new emails wrapped in `<user_email>` tags. It then streams events, answers every `agent.custom_tool_use`, and stops when the session goes idle with `end_turn`.
-- In `daily` mode the agent is told to finish by calling `submit_outfit`. If the session ends without a valid outfit, or with a refusal, the run sends the apology email (§6). Haiku 5.5 has **no server-side refusal fallback**.
-- Each session gets a `budget` cap (e.g. $0.25) so a stuck loop can't run up cost.
-- To change a prompt or tool, edit `agents/*.md` and run `ant apply`. The agent gets a new version, and the next run uses it.
+- **Stage A**: the scheduled deployment creates the daily session with `mode: daily` / `date: today` (§9.1). Setup and later chats are sessions the person starts in the Claude Console. In every case the tool worker answers each `agent.custom_tool_use` with a `user.custom_tool_result`.
+- **Stage B**: the orchestrator calls `sessions.create(agent=<id from claude-lock.json>, environment_id=<outfit-env>)` and sends the first `user.message`: a header (`mode: daily` + `date: YYYY-MM-DD`, or `mode: ingest`) followed by any new emails wrapped in `<user_email>` tags. It then streams events, answers every `agent.custom_tool_use`, and stops when the session goes idle with `end_turn`.
+- In `daily` mode the agent is told to finish by calling `submit_outfit`. Haiku 5.5 has **no server-side refusal fallback**. In stage B, a session that ends without a valid outfit, or with a refusal, gets the apology email (§6.2).
+- Each daily session has a `budget` cap of $0.25 (set on the deployment) so a stuck loop can't run up cost.
+- To change a prompt or tool, edit `agents/outfit-agent.md` and run `ant apply` on the agent **and** the deployment file (§9.1). The agent gets a new version, and the next run uses it.
+- Current agent version: **5** (2026-10-20).
 - Expected cost: about 15–25K input + 2K output tokens per day ≈ **< $0.01/day** at Haiku 5.5 prices ($0.10 / $0.50 per MTok).
 
 ### 11.2 `submit_outfit` schema (strict)
@@ -279,6 +338,14 @@ Part 1 of the same prompt covers the user's emails: extract facts and update mem
 
 ## 12. The daily email
 
+The daily outfit is **the only email** the system sends.
+
+**Stage A (running now)**: plain text, sent by `tools/LocalToolRunner` through Gmail SMTP (`smtp.gmail.com:587`, STARTTLS, app password) from `OUTFIT_SMTP_USER` to the address saved in the setup chat. A copy goes to `data/local-runner/outbox/`.
+- **Subject**: `{headline} [outfit#{id}]`
+- **Body**: "Good morning, {name}! Here's your outfit for {date}:", the items layer by layer with notes, *Why this works*, tips, the optional swap, and "Want changes? Tell me in your next chat with me on Claude Platform."
+- Without the two Gmail variables (§14), the runner only writes to the outbox and `complete_onboarding` tells the person email isn't switched on yet.
+
+**Stage B (planned)**:
 - **Subject**: `{weather emoji} {headline} · {min}–{max}°C [outfit#{id}]`
 - **Body** (HTML, single column, mobile-first, plus a plain-text alternative):
   1. Greeting + one-line weather summary (morning / midday / evening).
@@ -288,14 +355,16 @@ Part 1 of the same prompt covers the user's emails: extract facts and update mem
   5. Optional swap ("If it's colder than forecast: swap X for Y").
   6. **Rate today's outfit**: ⭐1 ⭐2 ⭐3 ⭐4 ⭐5 (`mailto:` links, §8).
   7. "Just reply to tell me anything: what you liked, what you don't own anymore, new clothes."
-- Sent from the agent mailbox to `USER_EMAIL`, with `Message-ID` saved so replies can be matched.
+- Sent from the agent mailbox to the user's email on file, with `Message-ID` saved so replies can be matched.
 
 ## 13. Memory database (SQLite)
+
+**Stage A** keeps the same information in one JSON file, `data/local-runner/state.json` (git-ignored): `profile` (including the email, `onboarding_status` and the `onboarding_answers` summary), `preferences`, `wardrobe` and `outfits` (with their feedback). Start over as a new user with `dotnet run --project tools/LocalToolRunner -- --reset`, after backing up the file. **Stage B** uses the SQLite schema below.
 
 ```sql
 CREATE TABLE users (
   id                INTEGER PRIMARY KEY,
-  email             TEXT NOT NULL UNIQUE,
+  email             TEXT UNIQUE,     -- NULL until set in the setup chat (§5.1); never changed by the agent afterwards
   name              TEXT,
   language          TEXT DEFAULT 'en',
   city              TEXT,
@@ -306,7 +375,7 @@ CREATE TABLE users (
   commute           TEXT,
   temp_sensitivity  TEXT DEFAULT 'neutral' CHECK (temp_sensitivity IN ('cold','neutral','hot')),
   onboarding_status TEXT NOT NULL DEFAULT 'new'
-                    CHECK (onboarding_status IN ('new','questionnaire_sent','wardrobe_review','active')),
+                    CHECK (onboarding_status IN ('new','active')),
   created_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -396,15 +465,24 @@ Schema changes go through numbered migration files (`migrations/001_init.sql`, �
 
 ## 14. Configuration & secrets
 
-GitHub → Settings → Secrets and variables → Actions:
+**Stage A (running now)**, all on the user's PC, never in the repo:
+
+| Name | Where | Note |
+|---|---|---|
+| `OUTFIT_SMTP_USER` | Windows user environment variable | The Gmail address the outfit is sent from |
+| `OUTFIT_SMTP_APP_PASSWORD` | Windows user environment variable | Gmail app password: 2-Step Verification on, then myaccount.google.com/apppasswords. The runner strips spaces and line breaks. |
+| Claude Platform login | `ant auth login` profile in `%APPDATA%\Anthropic` | Used by the runner (through `ant`) and by `ant apply`. Re-run `ant auth login` if it ever stops working. |
+
+Set the variables with `[Environment]::SetEnvironmentVariable("NAME", "value", "User")`. The runner reads them at start, so restart it after a change; its first lines say `Email: ON` or `Email: OFF`.
+
+**Stage B (planned)**: GitHub → Settings → Secrets and variables → Actions:
 
 | Name | Kind | Example / note |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | secret | Claude API key from the **same workspace** as the agents (*Default* workspace). A key from another workspace can't see them. |
 | `AGENT_EMAIL` | secret | Dedicated Gmail account for the agent (recommended), e.g. `my.outfit.agent@gmail.com` |
 | `AGENT_EMAIL_APP_PASSWORD` | secret | Gmail App Password (needs 2-Step Verification on that account) |
-| `USER_EMAIL` | secret | The recipient and the only allowed sender of replies |
-| `DATA_REPO_TOKEN` | secret | Fine-grained PAT, *Contents: read/write* on `Asaf_AI_Agent-data` only (§9.1) |
+| `DATA_REPO_TOKEN` | secret | Fine-grained PAT, *Contents: read/write* on `Asaf_AI_Agent-data` only (§9.3) |
 | `DATA_REPO` | variable | `hodaya73-prog/Asaf_AI_Agent-data` |
 | `TIMEZONE` | variable | `Asia/Jerusalem` |
 | `SEND_AFTER` | variable | `06:45` |
@@ -429,20 +507,28 @@ Because this repo is public:
 ```
 Asaf_AI_Agent/
 ├── SPEC.md
+├── Architecture.md
+├── .gitignore                # data/, *.db*, .env, bin/, obj/ — personal data never enters this repo
+├── agents/
+│   └── outfit-agent.md       # Managed Agent: frontmatter = config + custom tools, body = system prompt
+├── environments/outfit-env.yaml   # cloud container, no network
+├── deployments/outfit-daily.yaml  # stage A: 07:00 Asia/Jerusalem scheduled run
+├── claude-lock.json          # IDs written by `ant apply` (commit it)
+├── tools/LocalToolRunner/    # stage A tool worker (C#, .NET 9): tools, validation, Gmail SMTP
+│   ├── LocalToolRunner.csproj
+│   └── Program.cs
+├── data/                     # NOT in this repo (git-ignored)
+│   └── local-runner/         # stage A: state.json, outbox/, backups
+│
+│   Stage B (planned):
 ├── README.md                 # setup: secrets, Gmail app password, first run
 ├── pyproject.toml            # deps: anthropic, httpx, python-dotenv, jinja2; dev: pytest
 ├── .env.example
 ├── .github/workflows/agent.yml
-├── .gitignore                # data/, *.db*, .env — personal data never enters this repo
-├── data/                     # NOT in this repo: checkout of the private Asaf_AI_Agent-data repo
-│   └── agent.db              # created on first run
-├── agents/
-│   └── outfit-agent.md       # Managed Agent: frontmatter = config + custom tools, body = system prompt
-├── environments/outfit-env.yaml   # cloud container, no network
-├── claude-lock.json          # IDs written by `ant apply` (commit it)
+├── data/agent.db             # checkout of the private Asaf_AI_Agent-data repo
 ├── migrations/001_init.sql
 ├── src/outfit_agent/
-│   ├── main.py               # CLI: python -m outfit_agent {daily|ingest|onboard} [--dry-run]
+│   ├── main.py               # CLI: python -m outfit_agent {tools|daily|ingest} [--dry-run]
 │   ├── config.py             # env loading + validation
 │   ├── clock.py              # time guard, local date (injectable for tests)
 │   ├── db.py                 # connection, migrations, queries
@@ -452,8 +538,8 @@ Asaf_AI_Agent/
 │   ├── tools.py              # Python functions behind the custom tools (§7)
 │   ├── agents.py             # creates sessions, streams events, answers custom tool calls
 │   ├── validate.py           # §11.3 checks
-│   ├── prompts/              # system prompts, onboarding questionnaire
-│   └── templates/            # daily.html.j2, daily.txt.j2, wardrobe_review.html.j2
+│   ├── prompts/              # message headers for daily / ingest runs
+│   └── templates/            # daily.html.j2, daily.txt.j2 (the only email)
 └── tests/
 ```
 
@@ -463,16 +549,24 @@ Asaf_AI_Agent/
 - **Agent** (recorded): fixture DB plus fixed weather JSON (hot / rainy / cold / big temperature swing) → assert that `submit_outfit` passes validation and respects `never_wear`.
 - **Dry run** (local only, §14.1): `python -m outfit_agent daily --dry-run` prints the full email and the DB changes it would make.
 - **Log hygiene**: a test runs a full daily cycle on a fixture DB, captures all log output, and fails if any fixture email address, city, item name or preference text appears in it.
-- **Manual end-to-end**: `workflow_dispatch` with `mode=onboard`, reply from the phone, wait for the next ingest run, check the wardrobe-review email, then trigger `mode=daily`.
+- **Stage A end-to-end** (done 2026-10-20): start the runner, finish the setup chat in the Claude Console, then `ant beta:deployments run --deployment-id depl_01Y1QzXPprzAMfNy8nNzwNRf` and check that the outfit email arrives.
+- **Stage B end-to-end**: run `python -m outfit_agent tools` locally, open a session with the Outfit Agent in the Claude Console and complete the setup chat with a test address, then trigger `workflow_dispatch` with `mode=daily`, check the outfit email on the phone and reply to it with feedback.
 
 ## 17. Milestones
 
-0. **Agent on Claude Platform** ✅ (2026-10-19): *Outfit Agent* (version 2, 13 custom tools) and `outfit-agent-env` created with `ant apply`.
+**Stage A**
+- **Agent on Claude Platform** ✅ (2026-10-19): *Outfit Agent* and `outfit-agent-env` created with `ant apply`. Now version 5: 15 custom tools, setup chat, daily mode.
+- **Local tool worker** ✅ (2026-10-19): `tools/LocalToolRunner` answers the tools, enforces the onboarding and outfit rules, keeps `state.json`.
+- **Scheduled deployment + Gmail** ✅ (2026-10-20): 07:00 Asia/Jerusalem deployment, Gmail SMTP sending. First test email 2026-10-20 15:07; first scheduled run 2026-10-21 (sent late, runner was off).
+- Next: start the runner automatically when Windows starts, so the PC only needs to be on.
+
+**Stage B** (PC can be off)
+
 1. **Skeleton**: project setup, config, DB + migrations, `--dry-run` CLI.
 2. **Weather**: geocoding + forecast + summary, with tests.
 3. **Email**: SMTP send + IMAP read + rating-link parsing (no LLM yet).
 4. **Daily runs**: session driver, tool functions, `submit_outfit` handling, validation, HTML email.
-5. **Onboarding**: questionnaire, `ingest` sessions, wardrobe inference, wardrobe-review email.
+5. **Onboarding**: the `tools` worker and the setup chat in the Claude Console (questions, wardrobe inference and review, `complete_onboarding`).
 6. **Feedback loop**: replies → feedback/preferences/wardrobe; history in the daily prompt.
 7. **Deploy**: create the private `Asaf_AI_Agent-data` repo and its fine-grained token, set up the GitHub Actions workflow and secrets, add DB pull/push and the keep-alive step, then the first real 07:00 run.
 
@@ -483,4 +577,4 @@ Asaf_AI_Agent/
 - Photos of clothes (vision) to build the wardrobe instead of describing it.
 - Laundry state ("in the wash" for N days after wearing).
 - A web dashboard to browse the wardrobe and history.
-- Moving the scheduled run to Claude Managed Agents scheduled deployments if GitHub Actions becomes limiting.
+- Reading email replies and rating links in stage A (today only stage B plans IMAP).
