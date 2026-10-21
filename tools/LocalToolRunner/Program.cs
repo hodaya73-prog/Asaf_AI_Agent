@@ -8,8 +8,12 @@
 //   are set (user environment variables; never stored in the repo).
 // - Talks to Claude Platform through the `ant` CLI and its signed-in profile.
 //
+// - Only one runner at a time (a named mutex), so two copies never answer the same call.
+// - Everything it prints also goes to data/local-runner/runner.log.
+//
 // Run:  dotnet run --project tools/LocalToolRunner        (Ctrl+C to stop)
 //       dotnet run --project tools/LocalToolRunner -- --reset   (start over as a new user)
+// Auto-start: a shortcut in the Windows Startup folder runs the built exe at sign-in (SPEC.md §14).
 
 using System.Diagnostics;
 using System.Net;
@@ -19,14 +23,27 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
+using var singleInstance = new Mutex(initiallyOwned: true, @"Local\OutfitAgentToolRunner", out var isOnlyRunner);
+if (!isOnlyRunner)
+{
+    Console.WriteLine("Another Outfit Agent tool runner is already running on this PC. Exiting.");
+    return;
+}
+
 var repoRoot = FindRepoRoot();
 var agentId = ReadAgentId(repoRoot);
 var stateDir = Path.Combine(repoRoot, "data", "local-runner");
+Directory.CreateDirectory(stateDir);
+
+Console.OutputEncoding = Encoding.UTF8;
+var log = new StreamWriter(Path.Combine(stateDir, "runner.log"), append: true, Encoding.UTF8) { AutoFlush = true };
+Console.SetOut(new TeeWriter(Console.Out, log));
+Console.WriteLine($"=== started {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===");
+
 var store = new Store(stateDir, reset: args.Contains("--reset"));
 var ant = new Ant();
 var tools = new Tools(store);
 
-Console.OutputEncoding = Encoding.UTF8;
 Console.WriteLine($"Local tool runner for {agentId}");
 Console.WriteLine($"State and outbox: {stateDir}");
 Console.WriteLine(Mailer.Configured
@@ -85,6 +102,16 @@ static string ReadAgentId(string root)
 {
     var lockFile = JsonNode.Parse(File.ReadAllText(Path.Combine(root, "claude-lock.json")))!;
     return lockFile["resources"]!["./agents/outfit-agent.md"]!["id"]!.GetValue<string>();
+}
+
+/// Writes console output to the screen and the log file.
+class TeeWriter(TextWriter screen, TextWriter file) : TextWriter
+{
+    public override Encoding Encoding => Encoding.UTF8;
+    public override void Write(char value) { screen.Write(value); file.Write(value); }
+    public override void Write(string? value) { screen.Write(value); file.Write(value); }
+    public override void WriteLine(string? value) { screen.WriteLine(value); file.WriteLine(value); }
+    public override void Flush() { screen.Flush(); file.Flush(); }
 }
 
 /// Calls Claude Platform through the `ant` CLI.

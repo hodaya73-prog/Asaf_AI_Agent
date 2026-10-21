@@ -475,6 +475,12 @@ Schema changes go through numbered migration files (`migrations/001_init.sql`, �
 
 Set the variables with `[Environment]::SetEnvironmentVariable("NAME", "value", "User")`. The runner reads them at start, so restart it after a change; its first lines say `Email: ON` or `Email: OFF`.
 
+**Auto-start**: a shortcut named *Outfit Agent tool runner* in the Windows Startup folder (`shell:startup`) starts `tools\LocalToolRunner\bin\Debug\net9.0\LocalToolRunner.exe` minimized at sign-in, with the repo as its working folder. So the 07:00 email only needs the PC to be on and signed in.
+- Only one runner can run at a time. A second copy, for example a manual `dotnet run`, prints "already running" and exits.
+- Output also goes to `data/local-runner/runner.log` (git-ignored).
+- To rebuild, first close the running copy (its window, or end `LocalToolRunner` in Task Manager); a running exe can't be overwritten.
+- To turn auto-start off, delete the shortcut from `shell:startup`.
+
 **Stage B (planned)**: GitHub → Settings → Secrets and variables → Actions:
 
 | Name | Kind | Example / note |
@@ -558,7 +564,7 @@ Asaf_AI_Agent/
 - **Agent on Claude Platform** ✅ (2026-10-19): *Outfit Agent* and `outfit-agent-env` created with `ant apply`. Now version 5: 15 custom tools, setup chat, daily mode.
 - **Local tool worker** ✅ (2026-10-19): `tools/LocalToolRunner` answers the tools, enforces the onboarding and outfit rules, keeps `state.json`.
 - **Scheduled deployment + Gmail** ✅ (2026-10-20): 07:00 Asia/Jerusalem deployment, Gmail SMTP sending. First test email 2026-10-20 15:07; first scheduled run 2026-10-21 (sent late, runner was off).
-- Next: start the runner automatically when Windows starts, so the PC only needs to be on.
+- **Auto-start** ✅ (2026-10-21): the runner starts at Windows sign-in from a Startup-folder shortcut, single instance, with a log file (§14).
 
 **Stage B** (PC can be off)
 

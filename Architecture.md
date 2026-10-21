@@ -74,7 +74,7 @@ flowchart LR
 | **Outfit Agent** | Claude Platform, defined in `agents/outfit-agent.md` | Haiku 5.5, effort `medium`. Setup chat (Part 0), memory updates (Part 1), daily outfit (Part 2). Works only through its 15 custom tools. | §5, §7, §11 |
 | **Environment `outfit-agent-env`** | Claude Platform, `environments/outfit-env.yaml` | Cloud container with **no network** (`allowed_hosts: []`). All real work happens in the tools. | §7 |
 | **Scheduled deployment** | Claude Platform, `deployments/outfit-daily.yaml` | Creates the daily session at 07:00 Asia/Jerusalem, pinned to the agent version it was applied with, $0.25 cap per run | §9.1 |
-| **Tool runner** | User's PC, `tools/LocalToolRunner` (.NET 9) | Finds idle sessions of the agent, answers each custom tool call, enforces the rules (no email → only email tools; not set up → no outfit; one outfit per day; complete wardrobe before setup ends), sends the email | §4, §6.1, §7 |
+| **Tool runner** | User's PC, `tools/LocalToolRunner` (.NET 9), started at Windows sign-in by a Startup-folder shortcut; one instance only | Finds idle sessions of the agent, answers each custom tool call, enforces the rules (no email → only email tools; not set up → no outfit; one outfit per day; complete wardrobe before setup ends), sends the email | §4, §6.1, §7 |
 | **Memory** | User's PC, `data/local-runner/state.json` (git-ignored) | Profile (with the email and onboarding answers), preferences, wardrobe, outfits with feedback | §13 |
 | **Gmail** | The agent's Gmail account, app password in Windows user variables | Sends the daily outfit, and nothing else | §12, §14 |
 | **Open-Meteo** | SaaS, no key | Geocoding once in the setup chat, forecast every daily run | §10 |
@@ -280,13 +280,13 @@ Differences from stage A: no PC needed, email replies and rating links are read 
 
 | Failure | What happens (stage A) |
 |---|---|
-| PC off or runner not running at 07:00 | The session waits at its first tool call. When the runner starts, it continues and the email goes out late (happened 2026-10-21: run at 07:08, email at 21:14). |
+| PC off or runner not running at 07:00 | The session waits at its first tool call. When the runner starts, it continues and the email goes out late (happened 2026-10-21: run at 07:08, email at 21:14). Since then the runner starts automatically at Windows sign-in (Startup-folder shortcut), so only the PC being off or signed out delays the email. |
 | Gmail variables missing or wrong | The runner saves the outfit to the outbox, reports "not sent" or the SMTP error in its tab, and the agent is told. |
 | Open-Meteo down | `get_weather` returns an error; the agent submits a safe layered outfit and says the forecast was unavailable. |
 | Invalid outfit | The runner returns the problems; the agent fixes and resubmits. |
 | Second run on the same day | Refused: one outfit per day. |
 | Deployment run fails to start | Recorded as a deployment run with an error (`ant beta:deployment-runs list`); the next day's run is unaffected. |
 
-**Monitoring:** the runner's terminal tab shows every tool call and every email. The Claude Console shows each session's transcript and cost.
+**Monitoring:** the runner's minimized window and `data/local-runner/runner.log` show every tool call and every email. The Claude Console shows each session's transcript and cost.
 
 **Cost:** a daily run costs about $0.01–0.05 on Haiku 5.5 (the test run on 2026-10-20 cost about 1 cent of tokens), capped at $0.25 by the deployment. A setup chat cost about $0.05. Gmail and Open-Meteo are free.
